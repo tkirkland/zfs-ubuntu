@@ -1,0 +1,1485 @@
+#!/bin/bash
+
+# Proxmox-Style ZFS Installation Script
+# Based on Proxmox VE 9.0-1 installer procedures
+# Implements comprehensive ZFS-on-root installation with RAID support
+
+set -euo pipefail
+
+# =============================================================================
+# CONFIGURATION AND CONSTANTS
+# =============================================================================
+
+# ZFS Configuration (mimicking Proxmox defaults)
+declare -A zfs_opts=(
+    ["ashift"]="12"
+    ["compress"]="on"
+    ["checksum"]="on"
+    ["copies"]="1"
+    ["arc_max"]=""
+)
+
+# Progress tracking
+# CURRENT_PROGRESS=0  # Set in update_progress function
+# MAX_PROGRESS=100    # Currently unused
+
+# =============================================================================
+# LOGGING AND ERROR HANDLING
+# =============================================================================
+
+#######################################
+# Log a message with timestamp and level.
+# Globals:
+#   log_file
+# Arguments:
+#   Level string (INFO, WARN, ERROR)
+#   Message to log
+# Outputs:
+#   Writes a formatted message to stdout and log file
+#######################################
+log() {
+    local level="$1"
+    shift
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [${level}] $*" | tee -a "${log_file}"
+}
+
+#######################################
+# Log an informational message.
+# Arguments:
+#   Message to log
+#######################################
+log_info() {
+    log "INFO" "$@"
+}
+
+#######################################
+# Log a warning message.
+# Arguments:
+#   Message to log
+#######################################
+log_warn() {
+    log "WARN" "$@"
+}
+
+#######################################
+# Log an error message.
+# Arguments:
+#   Message to log
+#######################################
+log_error() {
+    log "ERROR" "$@"
+}
+
+#######################################
+# Log error message, cleanup, and exit.
+# Globals:
+#   None
+# Arguments:
+#   Error message
+# Returns:
+#   Exit status 1
+#######################################
+die() {
+    log_error "$@"
+    cleanup_on_error
+    exit 1
+}
+
+#######################################
+# Clean up resources on error.
+# Globals:
+#   target_dir
+#   pool_name
+#   temp_dir
+# Arguments:
+#   None
+#######################################
+cleanup_on_error() {
+    log_info "Performing cleanup due to error..."
+
+    # Unmount any mounted filesystems
+    if mountpoint -q "${target_dir}" 2>/dev/null; then
+        umount -R "${target_dir}" 2>/dev/null || true
+    fi
+
+    # Export any imported pools
+    if command -v zpool >/dev/null 2>&1; then
+        if zpool list "${pool_name}" >/dev/null 2>&1; then
+            log_info "Exporting ZFS pool ${pool_name}"
+            zpool export "${pool_name}" 2>/dev/null || true
+        fi
+    fi
+
+    # Clean up temporary directory
+    if [[ -d ${temp_dir} ]]; then
+        rm -rf "${temp_dir}"
+    fi
+
+    log_info "Cleanup completed"
+}
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+#######################################
+# Update and display installation progress.
+# Globals:
+#   CURRENT_PROGRESS
+# Arguments:
+#   Current progress percentage
+#   Progress description text
+#######################################
+update_progress() {
+    local current="$1"
+    local text="$2"
+
+    # CURRENT_PROGRESS="${current}"
+    echo "Progress: ${current}% - ${text}"
+    log_info "[${current}%] ${text}"
+}
+
+#######################################
+# Execute command with logging and error handling.
+# Arguments:
+#   Command to execute
+# Returns:
+#   Exit status of command or exits on failure
+#######################################
+syscmd() {
+    local cmd="$*"
+    log_info "Executing: ${cmd}"
+
+    if ! eval "${cmd}"; then
+        die "Command failed: ${cmd}"
+    fi
+}
+
+#######################################
+# Check system requirements for installation.
+# Globals:
+#   EUID
+# Arguments:
+#   None
+# Returns:
+#   0 if requirements met, exits on failure
+#######################################
+check_requirements() {
+    log_info "Checking system requirements..."
+
+    # Check if running as root
+    if ((EUID != 0)); then
+        die "This script must be run as root"
+    fi
+
+    # Check for required commands
+    local required_cmds=(
+        "zpool" "zfs" "sgdisk" "partprobe" "mkfs.vfat"
+        "debootstrap" "chroot" "mount" "umount"
+    )
+
+    local cmd
+    for cmd in "${required_cmds[@]}"; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            die "Required command not found: ${cmd}"
+        fi
+    done
+
+    # Check if EFI system
+    if [[ ! -d /sys/firmware/efi ]]; then
+        die "This script requires UEFI/EFI system"
+    fi
+
+    # Check available memory
+    local mem_kb
+    mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+    local mem_mb
+    mem_mb=$((mem_kb / 1024))
+
+    if ((mem_mb < 1024)); then
+        die "Insufficient memory: ${mem_mb}MB available, 1GB minimum required"
+    fi
+
+    log_info "System requirements check passed"
+}
+
+# =============================================================================
+# DISK DISCOVERY AND VALIDATION
+# =============================================================================
+
+#######################################
+# Get disk information (size, model, block size).
+# Arguments:
+#   Disk device path
+# Outputs:
+#   Writes "size_bytes:model:logical_block_size" to stdout
+# Returns:
+#   0 on success
+#######################################
+get_disk_info() {
+    local disk="$1"
+    local size_bytes
+    local model
+    local logical_bsize
+
+    # Get disk size in bytes
+    size_bytes="$(blockdev --getsize64 "${disk}" 2>/dev/null || echo "0")"
+
+    # Get disk model
+    model="$(lsblk -no MODEL "${disk}" 2>/dev/null | head -1 | xargs ||
+        echo "Unknown")"
+
+    # Get logical block size
+    logical_bsize="$(blockdev --getss "${disk}" 2>/dev/null || echo "512")"
+
+    echo "${size_bytes}:${model}:${logical_bsize}"
+}
+
+#######################################
+# Discover suitable disks for installation.
+# Arguments:
+#   None
+# Outputs:
+#   Writes a list of available disk paths to stdout
+# Returns:
+#   0 on success, exits if no disks found
+#######################################
+discover_disks() {
+    log_info "Discovering available disks..."
+
+    local disks=()
+    local disk
+
+    # Find all block devices that are not mounted and not part of arrays
+    while IFS= read -r disk; do
+        # Skip if the disk is mounted
+        if grep -q "^${disk}" /proc/mounts 2>/dev/null; then
+            continue
+        fi
+
+        # Skip if the disk is part of the RAID array
+        if [[ -f "/proc/mdstat" ]] && grep -q "$(basename "${disk}")" /proc/mdstat 2>/dev/null; then
+            continue
+        fi
+
+        # Skip if the disk is too small (minimum 20GB)
+        local disk_info
+        disk_info="$(get_disk_info "${disk}")"
+        local size_bytes="${disk_info%%:*}"
+        local size_gb
+        size_gb=$((size_bytes / 1024 / 1024 / 1024))
+
+        if ((size_gb < 20)); then
+            log_warn "Skipping disk ${disk}: too small (${size_gb} GB < 8 GB minimum)"
+            continue
+        fi
+
+        disks+=("${disk}")
+
+        local model="${disk_info#*:}"
+        model="${model%:*}"
+        log_info "Found disk: ${disk} (${size_gb} GB, ${model})"
+    done < <(lsblk -ndo NAME,TYPE | awk '$2=="disk" {print "/dev/"$1}')
+
+    if ((${#disks[@]} == 0)); then
+        die "No suitable disks found for installation"
+    fi
+
+    printf '%s\n' "${disks[@]}"
+}
+
+#######################################
+# Check 4K sector size compatibility.
+# Arguments:
+#   Logical block size in bytes
+# Returns:
+#   0 if compatible, exits if incompatible
+#######################################
+legacy_bios_4k_check() {
+    local logical_bsize="$1"
+
+    # Since we already checked for an EFI system, this should not be an issue
+    # But keeping the check for completeness
+    if ((logical_bsize == 4096)); then
+        log_warn "4K native drive detected - ensuring EFI boot mode"
+        if [[ ! -d /sys/firmware/efi ]]; then
+            die "4K native drives are not supported in legacy BIOS mode"
+        fi
+    fi
+}
+
+#######################################
+# Check disk size compatibility for mirroring.
+# Arguments:
+#   Expected size in bytes
+#   Actual size in bytes
+# Returns:
+#   0 if compatible, exits if incompatible
+#######################################
+zfs_mirror_size_check() {
+    local expected="$1"
+    local actual="$2"
+
+    # Allow 10% size difference tolerance
+    local diff
+    diff=$((expected > actual ? expected - actual : actual - expected))
+    local tolerance
+    tolerance=$((expected / 10))
+
+    if ((diff > tolerance)); then
+        die "Disk size mismatch: expected ~${expected} bytes, got ${actual} bytes " \
+            "(difference: ${diff} bytes > ${tolerance} tolerance)"
+    fi
+}
+
+# =============================================================================
+# ZFS POOL MANAGEMENT
+# =============================================================================
+
+#######################################
+# Load ZFS kernel module with retry logic.
+# Arguments:
+#   None
+# Returns:
+#   0 on success, exits on failure
+#######################################
+load_zfs_module() {
+    log_info "Loading ZFS kernel module..."
+
+    local retries=5
+    local i
+
+    for ((i = retries; i > 0; i--)); do
+        modprobe zfs 2>/dev/null || true
+        if [[ -c /dev/zfs ]]; then
+            log_info "ZFS module loaded successfully"
+            return 0
+        fi
+        log_warn "ZFS module not ready, retrying... ($i attempts remaining)"
+        sleep 1
+    done
+
+    die "Unable to load ZFS kernel module"
+}
+
+#######################################
+# Check for existing ZFS pools and validate the pool name.
+# Globals:
+#   pool_name
+# Arguments:
+#   None
+# Returns:
+#   0 if no conflicts, exits on conflict
+#######################################
+check_existing_pools() {
+    log_info "Checking for existing ZFS pools..."
+
+    local existing_pools
+    existing_pools="$(zpool import -d /dev 2>&1 | grep -E "^\s+pool:" | awk '{print $2}' || true)"
+
+    if [[ -n $existing_pools ]]; then
+        log_warn "Found existing ZFS pools:"
+        echo "$existing_pools" | while read -r pool; do
+            log_warn "  - $pool"
+        done
+
+        if echo "$existing_pools" | grep -q "^$pool_name$"; then
+            log_error "Pool name conflict: '$pool_name' already exists"
+            echo "Choose a different pool name or rename the existing pool:"
+            echo "  zpool import $pool_name"
+            echo "  zpool export $pool_name <new_name>"
+            die "Cannot proceed with existing pool name conflict"
+        fi
+    fi
+}
+
+#######################################
+# Calculate optimal ZFS ARC maximum size.
+# Globals:
+#   zfs_opts
+# Arguments:
+#   None
+#######################################
+calculate_arc_max() {
+    local total_memory_kb
+    total_memory_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    local total_memory_mb=$((total_memory_kb / 1024))
+
+    # Use 50% of system memory for ARC, with minimum 64MB and maximum
+    # leaving 1GB for the system
+    local arc_max_mb=$((total_memory_mb / 2))
+
+    # Minimum 64MB
+    if [[ $arc_max_mb -lt 64 ]]; then
+        arc_max_mb=64
+    fi
+
+    # Maximum: total memory minus 1GB for the system
+    local max_allowed=$((total_memory_mb - 1024))
+    if [[ $arc_max_mb -gt $max_allowed ]] && [[ $max_allowed -gt 64 ]]; then
+        arc_max_mb=$max_allowed
+    fi
+
+    zfs_opts["arc_max"]=$arc_max_mb
+    log_info "Calculated ZFS ARC max size: ${arc_max_mb}MB " \
+        "(Total memory: ${total_memory_mb}MB)"
+}
+
+#######################################
+# Get ZFS RAID vdev specification.
+# Arguments:
+#   Filesystem type
+#   Disk array
+# Outputs:
+#   Writes vdev specification to stdout
+#######################################
+get_zfs_raid_setup() {
+    local filesystem="$1"
+    shift
+    local disks=("$@")
+    local disk_count=${#disks[@]}
+    local vdev_spec=""
+
+    case "$filesystem" in
+    "zfs-raid0" | "zfs (RAID0)")
+        if [[ $disk_count -lt 1 ]]; then
+            die "RAID0 requires at least 1 disk"
+        fi
+        vdev_spec="${disks[*]}"
+        ;;
+
+    "zfs-raid1" | "zfs (RAID1)")
+        if [[ $disk_count -lt 2 ]]; then
+            die "RAID1 requires at least 2 disks"
+        fi
+
+        # Check disk sizes
+        local expected_size
+        local disk_info
+        disk_info=$(get_disk_info "${disks[0]}")
+        expected_size="${disk_info%%:*}"
+
+        for disk in "${disks[@]}"; do
+            disk_info=$(get_disk_info "$disk")
+            local actual_size="${disk_info%%:*}"
+            zfs_mirror_size_check "$expected_size" "$actual_size"
+        done
+
+        vdev_spec="mirror ${disks[*]}"
+        ;;
+
+    "zfs-raid10" | "zfs (RAID10)")
+        if [[ $disk_count -lt 4 ]]; then
+            die "RAID10 requires at least 4 disks"
+        fi
+        if [[ $((disk_count % 2)) -ne 0 ]]; then
+            die "RAID10 requires an even number of disks"
+        fi
+
+        # Create mirror pairs
+        local i
+        for ((i = 0; i < disk_count; i += 2)); do
+            local disk1="${disks[i]}"
+            local disk2="${disks[i + 1]}"
+
+            # Check sizes of a mirror pair
+            local disk1_info disk2_info
+            disk1_info=$(get_disk_info "$disk1")
+            disk2_info=$(get_disk_info "$disk2")
+            local size1="${disk1_info%%:*}"
+            local size2="${disk2_info%%:*}"
+            zfs_mirror_size_check "$size1" "$size2"
+
+            vdev_spec+=" mirror $disk1 $disk2"
+        done
+        vdev_spec="${vdev_spec# }" # Remove the leading space
+        ;;
+
+    "zfs-raidz1" | "zfs (RAIDZ-1)")
+        if [[ $disk_count -lt 3 ]]; then
+            die "RAIDZ-1 requires at least 3 disks"
+        fi
+
+        # Check disk sizes
+        local expected_size
+        local disk_info
+        disk_info=$(get_disk_info "${disks[0]}")
+        expected_size="${disk_info%%:*}"
+
+        for disk in "${disks[@]}"; do
+            disk_info=$(get_disk_info "$disk")
+            local actual_size="${disk_info%%:*}"
+            zfs_mirror_size_check "$expected_size" "$actual_size"
+        done
+
+        vdev_spec="raidz1 ${disks[*]}"
+        ;;
+
+    "zfs-raidz2" | "zfs (RAIDZ-2)")
+        if [[ $disk_count -lt 4 ]]; then
+            die "RAIDZ-2 requires at least 4 disks"
+        fi
+
+        # Check disk sizes
+        local expected_size
+        local disk_info
+        disk_info=$(get_disk_info "${disks[0]}")
+        expected_size="${disk_info%%:*}"
+
+        for disk in "${disks[@]}"; do
+            disk_info=$(get_disk_info "$disk")
+            local actual_size="${disk_info%%:*}"
+            zfs_mirror_size_check "$expected_size" "$actual_size"
+        done
+
+        vdev_spec="raidz2 ${disks[*]}"
+        ;;
+
+    "zfs-raidz3" | "zfs (RAIDZ-3)")
+        if [[ $disk_count -lt 5 ]]; then
+            die "RAIDZ-3 requires at least 5 disks"
+        fi
+
+        # Check disk sizes
+        local expected_size
+        local disk_info
+        disk_info=$(get_disk_info "${disks[0]}")
+        expected_size="${disk_info%%:*}"
+
+        for disk in "${disks[@]}"; do
+            disk_info=$(get_disk_info "$disk")
+            local actual_size="${disk_info%%:*}"
+            zfs_mirror_size_check "$expected_size" "$actual_size"
+        done
+
+        vdev_spec="raidz3 ${disks[*]}"
+        ;;
+
+    *)
+        die "Unknown ZFS RAID type: $filesystem"
+        ;;
+    esac
+
+    echo "$vdev_spec"
+}
+
+# =============================================================================
+# DISK PREPARATION AND PARTITIONING
+# =============================================================================
+
+#######################################
+# Wipe the disk and clear all data.
+# Arguments:
+#   Disk device path
+#######################################
+wipe_disk() {
+    local disk="$1"
+
+    log_info "Wiping disk $disk..."
+
+    # Unmount any mounted partitions
+    local mounted_parts part
+    mounted_parts="$(lsblk -lno NAME,MOUNTPOINT "${disk}" | awk '$2 != "" {print "/dev/"$1}' || true)"
+
+    if [[ -n $mounted_parts ]]; then
+        while IFS= read -r part; do
+            log_info "Unmounting $part"
+            umount "$part" 2>/dev/null || true
+        done <<<"$mounted_parts"
+    fi
+
+    # Deactivate any LVM volumes
+    if command -v vgchange >/dev/null 2>&1; then
+        vgchange -an 2>/dev/null || true
+    fi
+
+    # Clear ZFS labels
+    if command -v zpool >/dev/null 2>&1; then
+        zpool labelclear -f "$disk" 2>/dev/null || true
+    fi
+
+    # Wipe partition table and filesystem signatures
+    wipefs -af "$disk" 2>/dev/null || true
+
+    # Zero out the first and last few MB
+    dd if=/dev/zero of="$disk" bs=1M count=10 2>/dev/null || true
+    local disk_size_sectors
+    disk_size_sectors="$(blockdev --getsz "${disk}")"
+    dd if=/dev/zero of="${disk}" bs=1M count=10 \
+        seek=$((disk_size_sectors / 2048 - 10)) 2>/dev/null || true
+
+    # Wait for a device to settle
+    sleep 1
+    partprobe "$disk" 2>/dev/null || true
+
+    log_info "Disk $disk wiped successfully"
+}
+
+#######################################
+# Create partitions on a bootable disk.
+# Arguments:
+#   Disk device path
+#   Hard disk size
+#   ZFS partition type code
+# Outputs:
+#   Writes partition info to stdout
+#######################################
+partition_bootable_disk() {
+    local efi_part zfs_part
+    local disk="$1"
+    local hdsize="$2"
+    local zfs_part_type="$3" # Should be "BF01" for ZFS
+
+    log_info "Partitioning disk ${disk} (hdsize: ${hdsize}, " \
+        "zfs_part_type: ${zfs_part_type})..."
+
+    # Get disk info
+    local disk_info
+    disk_info=$(get_disk_info "$disk")
+    local logical_bsize="${disk_info##*:}"
+
+    # Check 4K sector compatibility
+    legacy_bios_4k_check "$logical_bsize"
+
+    # Create a GPT partition table
+    sgdisk --clear \
+        --new=1:2048:+${efi_size} --typecode=1:EF00 \
+        --change-name=1:"EFI System Partition" \
+        --new=2:0:0 --typecode=2:"${zfs_part_type}" --change-name=2:"ZFS" \
+        "$disk"
+
+    # Wait for partitions to be created
+    sleep 2
+    partprobe "$disk"
+    udevadm settle
+
+    if [[ $disk =~ ^/dev/nvme[0-9]+n[0-9]+$ ]]; then
+        efi_part="${disk}p1"
+        zfs_part="${disk}p2"
+    else
+        efi_part="${disk}1"
+        zfs_part="${disk}2"
+    fi
+    # Verify partitions exist
+    if [[ ! -b $efi_part ]]; then
+        die "EFI partition $efi_part was not created"
+    fi
+
+    if [[ ! -b $zfs_part ]]; then
+        die "ZFS partition $zfs_part was not created"
+    fi
+
+    log_info "Disk $disk partitioned successfully: EFI=$efi_part, ZFS=$zfs_part"
+    echo "$efi_part:$zfs_part:$logical_bsize"
+}
+
+# =============================================================================
+# ZFS POOL AND DATASET CREATION
+# =============================================================================
+
+#######################################
+# Create ZFS pool with specified configuration.
+# Arguments:
+#   Pool name
+#   Vdev specification
+#   Root volume name
+#######################################
+create_zfs_pool() {
+    local pool_name="$1"
+    local vdev_spec="$2"
+    local root_volume_name="$3"
+
+    log_info "Creating ZFS root pool '$pool_name' with vdev: $vdev_spec"
+
+    # Check for existing pools
+    check_existing_pools
+
+    # Create the pool with Proxmox-style options
+    local cmd="zpool create -f -o cachefile=none"
+
+    # Add ashift if configured
+    if [[ -n ${zfs_opts[ashift]} ]]; then
+        cmd+=" -o ashift=${zfs_opts[ashift]}"
+    fi
+
+    cmd+=" $pool_name $vdev_spec"
+
+    syscmd "$cmd"
+
+    log_info "ZFS pool '$pool_name' created successfully"
+
+    # Create a dataset hierarchy (Proxmox style)
+    log_info "Creating dataset hierarchy..."
+
+    syscmd "zfs create $pool_name/ROOT"
+    syscmd "zfs create $pool_name/ROOT/$root_volume_name"
+
+    # Set ZFS properties (mimicking Proxmox)
+    log_info "Configuring ZFS properties..."
+
+    # Enable atime with relatime optimization
+    syscmd "zfs set atime=on relatime=on $pool_name"
+
+    # Set compression
+    if [[ -n ${zfs_opts[compress]} ]]; then
+        syscmd "zfs set compression=${zfs_opts[compress]} $pool_name"
+    fi
+
+    # Set checksum algorithm
+    if [[ -n ${zfs_opts[checksum]} ]] &&
+        [[ ${zfs_opts[checksum]} != "on" ]]; then
+        syscmd "zfs set checksum=${zfs_opts[checksum]} $pool_name"
+    fi
+
+    # Set copies
+    if [[ -n ${zfs_opts[copies]} ]] &&
+        [[ ${zfs_opts[copies]} != "1" ]]; then
+        syscmd "zfs set copies=${zfs_opts[copies]} $pool_name"
+    fi
+
+    # Set POSIX ACLs on the root filesystem
+    syscmd "zfs set acltype=posix $pool_name/ROOT/$root_volume_name"
+
+    # Disable sync during installation for performance (Proxmox style)
+    syscmd "zfs set sync=disabled $pool_name"
+
+    log_info "ZFS pool and datasets configured successfully"
+}
+
+#######################################
+# Setup ZFS module configuration.
+# Arguments:
+#   Target directory
+#######################################
+setup_zfs_module_config() {
+    local target_dir="$1"
+
+    log_info "Setting up ZFS module configuration..."
+
+    local modprobe_dir="$target_dir/etc/modprobe.d"
+    mkdir -p "$modprobe_dir"
+
+    # Calculate ARC max in bytes
+    local arc_max_bytes=$((zfs_opts["arc_max"] * 1024 * 1024))
+
+    # Write ZFS module configuration
+    cat >"$modprobe_dir/zfs.conf" <<EOF
+# ZFS module configuration
+# Generated by $script_name on $(date)
+
+# Maximum ARC size (${zfs_opts["arc_max"]}MB)
+options zfs zfs_arc_max=$arc_max_bytes
+EOF
+
+    log_info "ZFS module configuration written to $modprobe_dir/zfs.conf"
+}
+
+# =============================================================================
+# FILESYSTEM CREATION AND MOUNTING
+# =============================================================================
+
+#######################################
+# Create EFI filesystems on boot partitions.
+# Arguments:
+#   Reference to a bootdev_info array
+#######################################
+create_efi_filesystems() {
+    local -n bootdev_info=$1
+
+    log_info "Creating EFI filesystems..."
+
+    for device_info in "${bootdev_info[@]}"; do
+        IFS=':' read -r efi_part zfs_part logical_bsize <<<"$device_info"
+
+        # Determine vfat options based on logical block size
+        local vfat_opts="-F32"
+        if [[ $logical_bsize == "4096" ]]; then
+            vfat_opts="-s1 -F32"
+        fi
+
+        log_info "Creating FAT32 filesystem on ${efi_part} " \
+            "(logical block size: ${logical_bsize})"
+        syscmd "mkfs.vfat $vfat_opts $efi_part"
+    done
+
+    log_info "EFI filesystems created successfully"
+}
+
+#######################################
+# Mount the target filesystem for installation.
+# Arguments:
+#   Pool name
+#   Root volume name
+#   Target directory
+#######################################
+mount_target_filesystem() {
+    local pool_name="$1"
+    local root_volume_name="$2"
+    local target_dir="$3"
+
+    log_info "Mounting target filesystem..."
+
+    # Set mountpoint for root dataset
+    syscmd "zfs set mountpoint=$target_dir $pool_name/ROOT/$root_volume_name"
+
+    # Mount the root dataset
+    syscmd "zfs mount $pool_name/ROOT/$root_volume_name"
+
+    # Create essential directories
+    mkdir -p "$target_dir/boot/efi"
+    mkdir -p "$target_dir/var/lib"
+    mkdir -p "$target_dir/mnt/hostrun"
+
+    # Bind mount /run for chroot operations
+    syscmd "mount --bind /run $target_dir/mnt/hostrun"
+
+    log_info "Target filesystem mounted successfully"
+}
+
+# =============================================================================
+# SYSTEM INSTALLATION
+# =============================================================================
+
+#######################################
+# Install base system using debootstrap.
+# Arguments:
+#   Target directory
+#   Distribution (optional, default: ubuntu)
+#   Release (optional, default: jammy)
+#######################################
+install_base_system() {
+    local target_dir="$1"
+    local distro="${2:-ubuntu}"
+    local release="${3:-jammy}"
+
+    log_info "Installing base system ($distro $release)..."
+
+    # Create basic filesystem structure
+    mkdir -p "$target_dir"/{dev,proc,sys,tmp,var/cache/apt/archives}
+
+    # Mount essential filesystems for chroot
+    mount -t proc proc "$target_dir/proc"
+    mount -t sysfs sysfs "$target_dir/sys"
+    mount -t devtmpfs devtmpfs "$target_dir/dev"
+    mount -t devpts devpts "$target_dir/dev/pts"
+    mount -t tmpfs tmpfs "$target_dir/tmp"
+
+    # Install base system using debootstrap
+    local mirror="https://archive.ubuntu.com/ubuntu"
+    if [[ $distro == "debian" ]]; then
+        mirror="https://deb.debian.org/debian"
+    fi
+
+    log_info "Running debootstrap..."
+    debootstrap --arch=amd64 \
+        --include=openssh-server,locales,sudo,wget,curl \
+        "${release}" "${target_dir}" "${mirror}"
+
+    # Configure the basic system
+    configure_base_system "$target_dir"
+
+    log_info "Base system installation completed successfully!"
+}
+
+#######################################
+# Configure base system settings.
+# Arguments:
+#   Target directory
+#######################################
+configure_base_system() {
+    local target_dir="$1"
+
+    log_info "Configuring base system..."
+
+    # Configure hostname
+    echo "zfs-system" >"$target_dir/etc/hostname"
+
+    # Configure hosts file
+    cat >"$target_dir/etc/hosts" <<EOF
+127.0.0.1   localhost
+127.0.1.1   zfs-system
+
+# The following lines are desirable for IPv6 capable hosts
+::1     ip6-localhost ip6-loopback
+fe00::0 ip6-localnet
+ff00::0 ip6-mcastprefix
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+EOF
+
+    # Configure network
+    cat >"$target_dir/etc/netplan/01-netcfg.yaml" <<EOF
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+EOF
+
+    # Configure apt sources
+    cat >"$target_dir/etc/apt/sources.list" <<EOF
+deb https://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+deb https://archive.ubuntu.com/ubuntu jammy-updates main restricted \
+    universe multiverse
+deb https://archive.ubuntu.com/ubuntu jammy-security main restricted \
+    universe multiverse
+deb https://archive.ubuntu.com/ubuntu jammy-backports main restricted \
+    universe multiverse
+EOF
+
+    # Configure locale
+    echo "en_US.UTF-8 UTF-8" >"$target_dir/etc/locale.gen"
+    chroot "$target_dir" locale-gen
+    echo 'LANG="en_US.UTF-8"' >"$target_dir/etc/default/locale"
+
+    # Install ZFS utilities in chroot
+    chroot "$target_dir" apt-get update
+    chroot "$target_dir" apt-get install -y zfsutils-linux
+
+    log_info "Base system configuration completed"
+}
+
+# =============================================================================
+# BOOTLOADER CONFIGURATION
+# =============================================================================
+
+#######################################
+# Install and configure bootloader.
+# Arguments:
+#   Target directory
+#   Pool name
+#   Root volume name
+#   Reference to a bootdev_info array
+#######################################
+install_bootloader() {
+    local target_dir="$1"
+    local pool_name="$2"
+    local root_volume_name="$3"
+    local -n bootdev_info=$4
+
+    log_info "Installing and configuring bootloader..."
+
+    # Install GRUB and related packages
+    chroot "${target_dir}" apt-get install -y grub-efi-amd64 \
+        grub-efi-amd64-signed shim-signed
+
+    # Mount EFI partitions
+    local efi_mount_count=0
+    for device_info in "${bootdev_info[@]}"; do
+        IFS=':' read -r efi_part zfs_part logical_bsize <<<"$device_info"
+
+        local efi_dir="$target_dir/boot/efi"
+        if [[ $efi_mount_count -gt 0 ]]; then
+            efi_dir="$target_dir/boot/efi$efi_mount_count"
+            mkdir -p "$efi_dir"
+        fi
+
+        log_info "Mounting EFI partition $efi_part to $efi_dir"
+        mount "$efi_part" "$efi_dir"
+
+        # Add the primary EFI partition to /etc/fstab
+        if [[ $efi_mount_count -eq 0 ]]; then
+            log_info "Adding EFI partition to /etc/fstab"
+            echo "UUID=$(blkid -o value -s UUID "$efi_part") /boot/efi vfat defaults 0 1" \
+                >>"$target_dir/etc/fstab"
+        fi
+
+        ((efi_mount_count++))
+    done
+
+    # Configure GRUB for ZFS
+    configure_grub_zfs "$target_dir" "$pool_name" "$root_volume_name"
+
+    # Install GRUB to all EFI partitions
+    efi_mount_count=0
+    for device_info in "${bootdev_info[@]}"; do
+        local efi_dir="/boot/efi"
+        if [[ $efi_mount_count -gt 0 ]]; then
+            efi_dir="/boot/efi$efi_mount_count"
+        fi
+
+        log_info "Installing GRUB to $efi_dir"
+        chroot "${target_dir}" grub-install --target=x86_64-efi \
+            --efi-directory="${efi_dir}" --bootloader-id=kubuntu
+
+        ((efi_mount_count++))
+    done
+
+    # Update GRUB configuration
+    chroot "$target_dir" update-grub
+
+    log_info "Bootloader installation completed"
+}
+#######################################
+# Configure GRUB for ZFS boot.
+# Arguments:
+#   Target directory
+#   Pool name
+#   Root volume name
+#######################################
+configure_grub_zfs() {
+    local target_dir="$1"
+    local pool_name="$2"
+    local root_volume_name="$3"
+
+    log_info "Configuring GRUB for ZFS..."
+
+    # Configure GRUB defaults
+    cat >"$target_dir/etc/default/grub" <<EOF
+# GRUB configuration for ZFS root
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR=\$(lsb_release -i -s 2> /dev/null || echo Debian)
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX="root=ZFS=$pool_name/ROOT/$root_volume_name"
+GRUB_PRELOAD_MODULES="zfs"
+
+# Disable os-prober to avoid issues with ZFS
+GRUB_DISABLE_OS_PROBER=false
+EOF
+
+    # Enable ZFS support in initramfs
+    echo "zfs" >>"$target_dir/etc/initramfs-tools/modules"
+
+    # Configure ZFS root filesystem
+    echo "UMOUNT_ROOT=yes" >>"$target_dir/etc/initramfs-tools/conf.d/zfs"
+    echo "ROOT=ZFS=${pool_name}/ROOT/${root_volume_name}" >> \
+        "${target_dir}/etc/initramfs-tools/conf.d/zfs"
+
+    # Update initramfs
+    chroot "$target_dir" update-initramfs -u -k all
+
+    log_info "GRUB ZFS configuration completed"
+}
+
+# =============================================================================
+# MAIN INSTALLATION PROCESS
+# =============================================================================
+
+#######################################
+# Extract data and perform installation.
+# Globals:
+#   hdsize, target_dir
+# Arguments:
+#   Pool name
+#   Root volume name
+#   RAID type
+#   Reference to selected_disks array
+#   3 - raid_type
+#   4 - selected_disks
+#######################################
+extract_data() {
+    local pool_name="$1"
+    local root_volume_name="$2"
+    local raid_type="$3"
+    local -n selected_disks_ref=$4
+
+    update_progress 0 "Starting installation process"
+
+    # Phase 1: Preparation
+    update_progress 5 "Loading ZFS module and checking requirements"
+    load_zfs_module
+    calculate_arc_max
+
+    # Phase 2: Disk preparation
+    update_progress 10 "Preparing disks"
+    local bootdev_info=()
+    local zfs_partitions=()
+
+    for disk in "${selected_disks_ref[@]}"; do
+        log_info "Processing disk: $disk"
+        wipe_disk "$disk"
+
+        local partition_info
+        partition_info=$(partition_bootable_disk "$disk" "$hdsize" "BF01")
+        bootdev_info+=("$partition_info")
+
+        # Extract ZFS partition
+        IFS=':' read -r efi_part zfs_part logical_bsize <<<"$partition_info"
+        zfs_partitions+=("$zfs_part")
+
+        log_info "Disk $disk prepared: EFI=$efi_part, ZFS=$zfs_part"
+    done
+
+    # Wait for udev to settle
+    udevadm settle
+
+    # Phase 3: ZFS pool creation
+    update_progress 25 "Creating ZFS pool"
+    local vdev_spec
+    vdev_spec=$(get_zfs_raid_setup "$raid_type" "${zfs_partitions[@]}")
+
+    create_zfs_pool "$pool_name" "$vdev_spec" "$root_volume_name"
+
+    # Phase 4: Filesystem setup
+    update_progress 35 "Creating filesystems"
+    create_efi_filesystems bootdev_info
+    mount_target_filesystem "$pool_name" "$root_volume_name" "$target_dir"
+
+    # Phase 5: System installation
+    update_progress 45 "Installing base system"
+    install_base_system "$target_dir"
+
+    # Phase 6: ZFS configuration
+    update_progress 75 "Configuring ZFS"
+    setup_zfs_module_config "$target_dir"
+
+    # Phase 7: Bootloader installation
+    update_progress 85 "Installing bootloader"
+    install_bootloader "${target_dir}" "${pool_name}" \
+        "${root_volume_name}" bootdev_info
+
+    # Phase 8: Final configuration
+    update_progress 95 "Finalizing installation"
+    finalize_installation "$target_dir" "$pool_name"
+
+    update_progress 100 "Installation completed successfully"
+}
+
+#######################################
+# Finalize installation and cleanup.
+# Globals:
+#   root_volume_name
+# Arguments:
+#   Target directory
+#   Pool name
+#######################################
+finalize_installation() {
+    local target_dir="$1"
+    local pool_name="$2"
+
+    log_info "Finalizing installation..."
+
+    # Re-enable sync for normal operation
+    syscmd "zfs set sync=standard $pool_name"
+
+    # Unmount filesystems
+    umount -R "$target_dir/mnt/hostrun" 2>/dev/null || true
+    umount -R "$target_dir/boot/efi"* 2>/dev/null || true
+    umount -R "$target_dir/dev" 2>/dev/null || true
+    umount -R "$target_dir/proc" 2>/dev/null || true
+    umount -R "$target_dir/sys" 2>/dev/null || true
+    umount -R "$target_dir/tmp" 2>/dev/null || true
+
+    # Set proper mount points for datasets
+    syscmd "zfs set mountpoint=/ $pool_name/ROOT/$root_volume_name"
+
+    # Export the pool
+    syscmd "zfs umount -a"
+    syscmd "zpool export $pool_name"
+
+    log_info "Installation finalized. System is ready for reboot."
+}
+
+# =============================================================================
+# USER INTERFACE AND CONFIGURATION
+# =============================================================================
+
+#######################################
+# Display script usage information.
+# Globals:
+#   script_name
+# Arguments:
+#   None
+# Outputs:
+#   Writes usage text to stdout
+#######################################
+
+#######################################
+# Show Help
+# Globals:
+#   script_name
+# Arguments:
+#  None
+#######################################
+show_usage() {
+    cat <<EOF
+Usage: $script_name [OPTIONS]
+
+Proxmox-style ZFS installation script for Ubuntu/Debian systems.
+
+OPTIONS:
+    -p, --pool-name NAME     ZFS pool name (default: rpool)
+    -r, --raid-type TYPE     RAID type: raid0, raid1, raid10, \
+                             raidz1, raidz2, raidz3
+    -d, --disks DISK,DISK    Comma-separated list of disks (/dev/sdX)
+    -s, --hdsize SIZE        Hard disk size to use (in GB, 0 = use all)
+    -t, --target-dir DIR     Target directory (default: /target)
+    -h, --help               Show this help message
+
+RAID TYPES:
+    raid0    - Stripe across disks (1+ disks, no redundancy)
+    raid1    - Mirror disks (2+ disks, 1 disk failure tolerance)
+    raid10   - Striped mirrors (4+ even disks, 1 disk per mirror failure " \
+        "tolerance)
+    raidz1   - Single parity (3+ disks, 1 disk failure tolerance)
+    raidz2   - Double parity (4+ disks, 2 disk failure tolerance)
+    raidz3   - Triple parity (5+ disks, 3 disk failure tolerance)
+
+EXAMPLES:
+    # Install with RAIDZ1 on 3 disks
+    $script_name --raid-type raidz1 --disks /dev/sda,/dev/sdb,/dev/sdc
+
+    # Install with RAID1 mirror on 2 disks, custom pool name
+    $script_name --pool-name tank --raid-type raid1 \
+        --disks /dev/nvme0n1,/dev/nvme1n1
+
+EOF
+}
+
+#######################################
+# Parse command line arguments.
+# Globals:
+#   pool_name, raid_type, selected_disks, hdsize, target_dir
+# Arguments:
+#   Command line arguments
+#######################################
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        -p | --pool-name)
+            pool_name="$2"
+            shift 2
+            ;;
+        -r | --raid-type)
+            raid_type="zfs-$2"
+            shift 2
+            ;;
+        -d | --disks)
+            IFS=',' read -ra selected_disks <<<"$2"
+            shift 2
+            ;;
+        -s | --hdsize)
+            hdsize="$2"
+            shift 2
+            ;;
+        -t | --target-dir)
+            target_dir="$2"
+            shift 2
+            ;;
+        -h | --help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            show_usage
+            exit 1
+            ;;
+        esac
+    done
+}
+
+#######################################
+# Interactive setup for disk and RAID configuration.
+# Globals:
+#   Multiple global variables
+# Arguments:
+#   None
+#######################################
+interactive_setup() {
+    echo "=== Proxmox-Style ZFS Installation Setup ==="
+    echo
+
+    # Discover available disks
+    echo "Discovering available disks..."
+    local available_disks
+    mapfile -t available_disks < <(discover_disks)
+
+    if ((${#available_disks[@]} == 0)); then
+        die "No suitable disks found for installation"
+    fi
+
+    echo "Available disks:"
+    local i=1
+    for disk in "${available_disks[@]}"; do
+        local disk_info
+        disk_info=$(get_disk_info "$disk")
+        local size_bytes="${disk_info%%:*}"
+        local model="${disk_info#*:}"
+        model="${model%:*}"
+        local size_gb=$((size_bytes / 1024 / 1024 / 1024))
+
+        echo "  $i) $disk ($size_gb GB, $model)"
+        ((i++))
+    done
+    echo
+
+    # Pool name selection
+    if [[ -z $pool_name ]]; then
+        read -r -p "ZFS pool name [rpool]: " pool_name
+        pool_name="${pool_name:-rpool}"
+    fi
+
+    # RAID type selection
+    if [[ -z $raid_type ]]; then
+        echo "Select RAID type:"
+        echo "  1) RAID0 (stripe, no redundancy, 1+ disks)"
+        echo "  2) RAID1 (mirror, 1 disk failure, 2+ disks)"
+        echo "  3) RAID10 (striped mirrors, 1 disk per mirror failure, " \
+            "4+ even disks)"
+        echo "  4) RAIDZ1 (single parity, 1 disk failure, 3+ disks)"
+        echo "  5) RAIDZ2 (double parity, 2 disk failure, 4+ disks)"
+        echo "  6) RAIDZ3 (triple parity, 3 disk failure, 5+ disks)"
+
+        local raid_choice
+        read -r -p "Choice [4]: " raid_choice
+        raid_choice="${raid_choice:-4}"
+
+        case "${raid_choice}" in
+        1) raid_type="zfs-raid0" ;;
+        2) raid_type="zfs-raid1" ;;
+        3) raid_type="zfs-raid10" ;;
+        4) raid_type="zfs-raidz1" ;;
+        5) raid_type="zfs-raidz2" ;;
+        6) raid_type="zfs-raidz3" ;;
+        *) die "Invalid RAID type selection: ${raid_choice}" ;;
+        esac
+    fi
+
+    # Disk selection
+    local disk_numbers num required_disks confirm
+    if ((${#selected_disks[@]} == 0)); then
+        echo "Select disks for installation (space-separated numbers):"
+        read -r -p "Disk numbers: " disk_numbers
+        for num in $disk_numbers; do
+            if ((num > 0 && num <= ${#available_disks[@]})); then
+                selected_disks+=("${available_disks[$((num - 1))]}")
+            else
+                die "Invalid disk number: $num"
+            fi
+        done
+    fi
+
+    # Validate disk selection for RAID type
+    case "${raid_type}" in
+    "zfs-raid0") required_disks=1 ;;
+    "zfs-raid1") required_disks=2 ;;
+    "zfs-raid10") required_disks=4 ;;
+    "zfs-raidz1") required_disks=3 ;;
+    "zfs-raidz2") required_disks=4 ;;
+    "zfs-raidz3") required_disks=5 ;;
+    esac
+
+    if ((${#selected_disks[@]} < required_disks)); then
+        die "RAID type ${raid_type#zfs-} requires at least ${required_disks} " \
+            "disks, but only ${#selected_disks[@]} selected"
+    fi
+
+    if [[ ${raid_type} == "zfs-raid10" ]] && ((${#selected_disks[@]} % 2 != 0)); then
+        die "RAID10 requires an even number of disks"
+    fi
+
+    # Generate root volume name
+    root_volume_name="ubuntu-$(openssl rand -hex 3)"
+
+    echo
+    echo "Installation Configuration:"
+    echo "  Pool name: $pool_name"
+    echo "  RAID type: ${raid_type#zfs-}"
+    echo "  Root volume: $root_volume_name"
+    echo "  Selected disks: ${selected_disks[*]}"
+    echo "  Target directory: $target_dir"
+    echo
+
+    read -r -p "Proceed with installation? [y/N]: " confirm
+    if [[ $confirm != "y" && $confirm != "Y" ]]; then
+        echo "Installation cancelled."
+        exit 0
+    fi
+}
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+#######################################
+# Main installation function.
+# Globals:
+#   All global variables
+# Arguments:
+#   Command line arguments
+# Returns:
+#   0 on success, exits on failure
+#######################################
+main() {
+    if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+        return 0
+    fi
+
+    trap cleanup_on_error EXIT
+
+    log_file="/tmp/zfs-install-$(date +%Y%m%d-%H%M%S).log"
+    readonly temp_dir="/tmp/zfs-install-$$"
+
+    # Setup logging
+    mkdir -p "$(dirname "$log_file")"
+    mkdir -p "$temp_dir"
+
+    script_name=""
+    script_name="$(basename "$0")"
+    readonly script_name
+
+    # System Configuration
+    pool_name="rpool"
+    root_volume_name=""
+    # FILESYSTEM_TYPE="zfs"  # Currently unused
+    raid_type=""
+    target_dir="/target"
+    efi_size="512M"
+    selected_disks=()
+    hdsize=""
+
+    log_info "Starting $script_name"
+    log_info "Command line: $*"
+
+    # Parse arguments
+    parse_arguments "$@"
+
+    # Check requirements
+    check_requirements
+
+    # Interactive setup if install not fully configured via arguments
+    if [[ -z ${raid_type} ]] || ((${#selected_disks[@]} == 0)); then
+        interactive_setup
+    fi
+
+    # Final validation
+    if [[ -z ${pool_name} || -z ${raid_type} ]] ||
+        ((${#selected_disks[@]} == 0)); then
+        die "Missing required configuration parameters"
+    fi
+
+    # Generate root volume name if not set
+    if [[ -z $root_volume_name ]]; then
+        root_volume_name="ubuntu-$(openssl rand -hex 3)"
+    fi
+
+    # Show the final configuration
+    log_info "Final configuration:"
+    log_info "  Pool name: $pool_name"
+    log_info "  RAID type: $raid_type"
+    log_info "  Root volume: $root_volume_name"
+    log_info "  Selected disks: ${selected_disks[*]}"
+    log_info "  Target directory: $target_dir"
+
+    # Perform installation
+    extract_data "$pool_name" "$root_volume_name" "$raid_type" selected_disks
+
+    # Clear the trap since we completed successfully
+    trap - EXIT
+
+    echo
+    echo "================================================================"
+    echo "Installation completed successfully!"
+    echo "================================================================"
+    echo "Pool name: $pool_name"
+    echo "Root dataset: $pool_name/ROOT/$root_volume_name"
+    echo "Log file: $log_file"
+    echo
+    echo "The system is ready for reboot."
+    echo "After reboot, the system will boot from the ZFS root filesystem."
+    echo "================================================================"
+}
+
+main "$@"
