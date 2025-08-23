@@ -1,0 +1,355 @@
+################################################################################
+# Kubuntu ZFS Installation - Actual Commands Executed
+# Extracted from kubuntu_zfs.sh script
+# Note: Variables like ${disk1}, ${uuid}, etc. would be replaced with actual values
+################################################################################
+
+#==============================================================================
+# PHASE 1: ENVIRONMENT PREPARATION
+#==============================================================================
+
+# Update package repositories
+apt update
+
+# Install required packages
+apt install --yes gdisk zfsutils-linux rsync parted
+
+# Install NVMe tools if NVMe disks detected
+apt install --yes nvme-cli
+
+# Install SMART tools
+apt install --yes smartmontools
+
+# Stop ZFS Event Daemon
+systemctl stop zed
+
+
+#==============================================================================
+# PHASE 2: DISK SELECTION
+#==============================================================================
+
+# List available disks (informational)
+lsblk -d -n -o NAME,TYPE
+lsblk -b -d -n -o SIZE "${device}"
+lsblk -d -n -o MODEL "${device}"
+
+# Validate disks - check if block device
+lsblk -n -o MOUNTPOINT "${disk}"
+lsblk -b -n -d -o SIZE "${disk}"
+
+# Check disk health (for NVMe)
+nvme smart-log "${real_device}"
+
+# Check disk health (for SATA/SAS)
+smartctl -H "${real_device}"
+
+# Detect sector size for NVMe
+nvme id-ns "${real_device}" -n 1
+
+
+#==============================================================================
+# PHASE 3: DISK PREPARATION
+#==============================================================================
+
+# Disable swap
+swapoff --all
+
+# For each disk (disk1, disk2, disk3):
+
+# Wipe filesystem signatures
+wipefs -a "${disk}"
+
+# Clear partition table
+sgdisk --zap-all "${disk}"
+
+# Clear LVM metadata
+dd if=/dev/zero of="${disk}" bs=1M count=10
+
+# Inform kernel of changes
+partprobe "${disk}"
+udevadm settle --timeout=10
+
+# Create GPT partition table
+sgdisk -og "${disk}"
+
+# Create partitions on each disk
+sgdisk -n1:1M:+512M -t1:EF00 -c1:"EFI" "${disk}"
+sgdisk -n2:0:+8G -t2:8200 -c2:"swap" "${disk}"
+sgdisk -n3:0:+2G -t3:BE00 -c3:"bpool" "${disk}"
+sgdisk -n4:0:+400G -t4:BF00 -c4:"rpool" "${disk}"
+sgdisk -n5:0:0 -t5:BF00 -c5:"hpool" "${disk}"
+
+# Print partition table
+sgdisk -p "${disk}"
+
+# Wait for partitions
+partprobe "${disk}"
+udevadm settle --timeout=10
+
+# Format EFI partitions (for each disk)
+mkdosfs -F 32 -s 1 -n "EFI1" "${disk1}-part1"
+mkdosfs -F 32 -s 1 -n "EFI2" "${disk2}-part1"
+mkdosfs -F 32 -s 1 -n "EFI3" "${disk3}-part1"
+
+
+#==============================================================================
+# PHASE 4: ZFS POOL CREATION
+#==============================================================================
+
+# Create boot pool (bpool)
+zpool create \
+    -o ashift=12 \
+    -o autotrim=on \
+    -o cachefile=/etc/zfs/zpool.cache \
+    -o compatibility=grub2 \
+    -o feature@livelist=enabled \
+    -o feature@zpool_checkpoint=enabled \
+    -O devices=off \
+    -O acltype=posixacl -O xattr=sa \
+    -O compression=lz4 \
+    -O normalization=formD \
+    -O relatime=on \
+    -O canmount=off -O mountpoint=/boot -R /mnt \
+    bpool raidz1 "${disk1}-part3" "${disk2}-part3" "${disk3}-part3"
+
+# Verify creation
+zpool list bpool
+zpool status bpool
+
+# Create root pool (rpool) - encrypted
+zpool create \
+    -o ashift=12 \
+    -o autotrim=on \
+    -O encryption=on -O keylocation=prompt -O keyformat=passphrase \
+    -O acltype=posixacl -O xattr=sa -O dnodesize=auto \
+    -O compression=lz4 \
+    -O normalization=formD \
+    -O relatime=on \
+    -O canmount=off -O mountpoint=/ -R /mnt \
+    rpool raidz1 "${disk1}-part4" "${disk2}-part4" "${disk3}-part4"
+
+# Verify creation
+zpool list rpool
+zpool status rpool
+
+# Create home pool (hpool) - encrypted
+zpool create \
+    -o ashift=12 \
+    -o autotrim=on \ \
+    -O acltype=posixacl -O xattr=sa -O dnodesize=auto \
+    -O compression=lz4 \
+    -O normalization=formD \
+    -O relatime=on \
+    -O canmount=off -O mountpoint=/home -R /mnt \
+    hpool raidz1 "${disk1}-part5" "${disk2}-part5" "${disk3}-part5"
+
+# Verify creation
+zpool list hpool
+zpool status hpool
+
+#==============================================================================
+# PHASE 5: DATASET CREATION
+#==============================================================================
+
+# Generate UUID
+dd if=/dev/urandom bs=1 count=100 | tr -dc 'a-z0-9' | cut -c-6
+
+# Create container datasets
+zfs create -o canmount=off -o mountpoint=none rpool/ROOT
+zfs create -o canmount=off -o mountpoint=none bpool/BOOT
+zfs create -o canmount=off -o mountpoint=none hpool/HOME
+
+# Create system datasets
+zfs create -o mountpoint=/ \
+    -o com.ubuntu.zsys:bootfs=yes \
+    -o com.ubuntu.zsys:last-used="$(date +%s)" \
+    "rpool/ROOT/kubuntu_${uuid}"
+
+zfs create -o mountpoint=/boot "bpool/BOOT/kubuntu_${uuid}"
+zfs create -o mountpoint=/home "hpool/HOME/kubuntu_${uuid}"
+
+# Create system subdatasets
+zfs create -o com.ubuntu.zsys:bootfs=no -o canmount=off "rpool/ROOT/kubuntu_${uuid}/usr"
+zfs create -o com.ubuntu.zsys:bootfs=no -o canmount=off "rpool/ROOT/kubuntu_${uuid}/var"
+
+# Create specific datasets for directories
+zfs create "rpool/ROOT/kubuntu_${uuid}/var/lib"
+zfs create "rpool/ROOT/kubuntu_${uuid}/var/log"
+zfs create "rpool/ROOT/kubuntu_${uuid}/var/spool"
+zfs create "rpool/ROOT/kubuntu_${uuid}/var/cache"
+zfs create "rpool/ROOT/kubuntu_${uuid}/var/tmp"
+zfs create "rpool/ROOT/kubuntu_${uuid}/var/lib/apt"
+zfs create "rpool/ROOT/kubuntu_${uuid}/var/lib/dpkg"
+zfs create "rpool/ROOT/kubuntu_${uuid}/var/snap"
+zfs create "rpool/ROOT/kubuntu_${uuid}/var/lib/AccountsService"
+zfs create "rpool/ROOT/kubuntu_${uuid}/var/lib/NetworkManager"
+zfs create "rpool/ROOT/kubuntu_${uuid}/usr/local"
+zfs create "rpool/ROOT/kubuntu_${uuid}/srv"
+
+# Set permissions
+chmod 1777 /mnt/var/tmp
+
+# Create user data datasets
+zfs create -o canmount=off -o mountpoint=/ rpool/USERDATA
+zfs create -o com.ubuntu.zsys:bootfs-datasets="rpool/ROOT/kubuntu_${uuid}" \
+    -o canmount=on -o mountpoint=/root \
+    "rpool/USERDATA/root_${uuid}"
+
+chmod 700 /mnt/root
+
+# Create runtime filesystem
+mkdir /mnt/run
+mount -t tmpfs tmpfs /mnt/run
+mkdir /mnt/run/lock
+
+
+#==============================================================================
+# PHASE 6: SYSTEM INSTALLATION
+#==============================================================================
+
+# Find and mount Kubuntu ISO
+mkdir -p /mnt/cdrom
+findmnt -n -o SOURCE /
+blkid -L "Kubuntu"
+mount "${iso_source}" /mnt/cdrom
+
+# Mount squashfs
+mkdir -p /mnt/source
+mount -t squashfs "/mnt/cdrom/casper/filesystem.squashfs" /mnt/source
+
+# Copy system files
+rsync -av --progress /mnt/source/ /mnt/ \
+    --exclude=/proc --exclude=/sys --exclude=/dev \
+    --exclude=/run --exclude=/mnt --exclude=/media \
+    --exclude=/tmp --exclude=/var/tmp
+
+# Cleanup
+umount /mnt/source
+rmdir /mnt/source
+umount /mnt/cdrom
+
+# Copy ZFS cache
+mkdir -p /mnt/etc/zfs
+cp /etc/zfs/zpool.cache /mnt/etc/zfs/
+
+# Set hostname
+echo "${HOSTNAME}" > /mnt/etc/hostname
+
+# Configure network
+mkdir -p /mnt/etc/netplan
+
+
+#==============================================================================
+# PHASE 7-9: CHROOT OPERATIONS
+#==============================================================================
+
+# Mount virtual filesystems for chroot
+mount --make-private --rbind /dev /mnt/dev
+mount --make-private --rbind /proc /mnt/proc
+mount --make-private --rbind /sys /mnt/sys
+
+# Execute in chroot environment
+chroot /mnt /bin/bash /root/chroot-install.sh
+
+#--- Commands executed inside chroot ---
+
+# Update package database
+apt update
+
+# Configure locales and timezone
+dpkg-reconfigure locales
+dpkg-reconfigure tzdata
+dpkg-reconfigure keyboard-configuration
+
+# Install essential packages
+apt install --yes nano vim cryptsetup
+
+# Configure EFI
+mkdir -p /boot/efi
+blkid -s UUID -o value ${DISK1}-part1
+mount /boot/efi
+
+# Additional EFI mounts
+mkdir -p /boot/efi2 /boot/efi3
+blkid -s UUID -o value ${DISK2}-part1
+blkid -s UUID -o value ${DISK3}-part1
+
+# Install boot system
+apt install --yes \
+    grub-efi-amd64 grub-efi-amd64-signed \
+    linux-image-generic shim-signed \
+    zfs-initramfs
+
+# Install KDE desktop
+apt install --yes kubuntu-desktop-minimal plasma-workspace-wayland
+
+# Remove unnecessary packages
+apt purge --yes os-prober
+apt autoremove --yes
+
+# Set root password
+passwd
+
+# Create user
+dd if=/dev/urandom bs=1 count=100 | tr -dc 'a-z0-9' | cut -c-6
+zfs create -o com.ubuntu.zsys:bootfs-datasets="rpool/ROOT/kubuntu_${UUID}" \
+    -o canmount=on -o mountpoint="/home/${USERNAME}" \
+    "hpool/HOME/kubuntu_${UUID}/${USERNAME}_${UUID_USER}"
+
+adduser "${USERNAME}"
+usermod -a -G adm,cdrom,dip,lpadmin,plugdev,sambashare,sudo "${USERNAME}"
+
+# Generate initramfs
+update-initramfs -c -k all
+
+# Configure and install GRUB
+update-grub
+grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+    --bootloader-id=kubuntu --recheck --no-floppy
+
+# Backup GRUB to additional EFI partitions
+mount /boot/efi2
+grub-install --target=x86_64-efi --efi-directory=/boot/efi2 \
+    --bootloader-id=kubuntu-backup1 --recheck --no-floppy
+umount /boot/efi2
+
+mount /boot/efi3
+grub-install --target=x86_64-efi --efi-directory=/boot/efi3 \
+    --bootloader-id=kubuntu-backup2 --recheck --no-floppy
+umount /boot/efi3
+
+# Configure ZFS boot
+mkdir -p /etc/zfs/zfs-list.cache
+touch /etc/zfs/zfs-list.cache/bpool
+touch /etc/zfs/zfs-list.cache/rpool
+touch /etc/zfs/zfs-list.cache/hpool
+zed -F &
+sleep 5
+kill $ZED_PID
+sed -Ei "s|/mnt/?|/|" /etc/zfs/zfs-list.cache/*
+
+# Configure swap
+blkid -s UUID -o value ${DISK1}-part2
+mkswap -f -L swap1 "${DISK1}-part2"
+
+# Configure services
+systemctl enable sddm
+systemctl enable NetworkManager
+systemctl enable zfs-import-cache
+systemctl enable zfs-mount
+systemctl enable zfs.target
+systemctl enable tmp.mount
+
+# Remove netplan config for NetworkManager
+rm -f /etc/netplan/01-netcfg.yaml
+
+#--- End of chroot commands ---
+
+# Cleanup and export pools (outside chroot)
+mount | grep -v zfs | tac | awk '/\/mnt/ {print $3}' | xargs -I {} umount -lf {}
+zpool export bpool
+zpool export rpool
+zpool export hpool
+
+# Final reboot
+reboot
