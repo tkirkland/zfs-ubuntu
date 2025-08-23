@@ -1,0 +1,10 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Sudo run" type="BashProRunConfiguration">
+    <option name="outputCharset" value="UTF-8" />
+    <option name="scriptPath" value="$PROJECT_DIR$/kubuntu_zfs.sh" />
+    <option name="sudoEnabled" value="true" />
+    <option name="workingDirectory" value="$PROJECT_DIR$" />
+    <RunnerSettings bashdbVersion="Automatic" bashPathMapper="Automatic" RunnerId="pro.bashsupport.shDebugRunner" />
+    <method v="2" />
+  </configuration>
+</component>

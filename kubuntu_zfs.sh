@@ -119,9 +119,9 @@ error_handler() {
 
     # Attempt cleanup
     log_info "Attempting to clean up ZFS pools..."
-    zpool export bpool 2>/dev/null && log_info "Exported bpool" || true
-    zpool export rpool 2>/dev/null && log_info "Exported rpool" || true
-    zpool export hpool 2>/dev/null && log_info "Exported hpool" || true
+    zpool export bpool 2> /dev/null && log_info "Exported bpool" || true
+    zpool export rpool 2> /dev/null && log_info "Exported rpool" || true
+    zpool export hpool 2> /dev/null && log_info "Exported hpool" || true
 
     exit "${exit_code}"
 }
@@ -134,7 +134,7 @@ error_handler() {
 #   Checkpoint name
 #######################################
 save_checkpoint() {
-    echo "$1" >"${CHECKPOINT_FILE}"
+    echo "$1" > "${CHECKPOINT_FILE}"
     log_info "Checkpoint saved: $1"
 }
 
@@ -150,9 +150,9 @@ save_checkpoint() {
 load_checkpoint() {
     if [[ -f ${CHECKPOINT_FILE} ]]; then
         cat "${CHECKPOINT_FILE}"
-    else
+  else
         echo "none"
-    fi
+  fi
 }
 
 #######################################
@@ -162,7 +162,7 @@ load_checkpoint() {
 # Arguments:
 #   Phase name
 # Returns:
-#   0 if should skip, 1 otherwise
+#   0 if you should skip, 1 otherwise
 #######################################
 should_skip_phase() {
     local phase="$1"
@@ -171,7 +171,7 @@ should_skip_phase() {
 
     if [[ ${checkpoint} == "none" ]]; then
         return 1
-    fi
+  fi
 
     # Extract phase numbers for comparison
     local checkpoint_num="${checkpoint#phase}"
@@ -180,7 +180,7 @@ should_skip_phase() {
     if [[ ${checkpoint_num} -ge ${current_num} ]]; then
         log_info "Skipping ${phase} (already completed)"
         return 0
-    fi
+  fi
 
     return 1
 }
@@ -204,8 +204,8 @@ confirm() {
         yes | YES | y | Y) return 0 ;;
         no | NO | n | N) return 1 ;;
         *) echo "Please answer 'yes' or 'no'" ;;
-        esac
-    done
+    esac
+  done
 }
 
 #######################################
@@ -222,7 +222,7 @@ check_root() {
         log_error "This script must be run as root"
         echo "Please run: sudo $0"
         exit 1
-    fi
+  fi
 }
 
 #######################################
@@ -235,14 +235,14 @@ check_root() {
 check_network() {
     log_info "Checking network connectivity..."
 
-    if ! ping -c 1 archive.ubuntu.com >/dev/null 2>&1; then
+    if ! ping -c 1 archive.ubuntu.com > /dev/null 2>&1; then
         log_warn "No network connectivity to Ubuntu archives"
         if ! confirm "Continue without network? (NOT recommended)"; then
             exit 1
-        fi
-    else
-        log_info "Network connectivity verified"
     fi
+  else
+        log_info "Network connectivity verified"
+  fi
 }
 
 #######################################
@@ -258,7 +258,7 @@ wait_for_partitions() {
     log_info "Waiting for partition devices to be created for ${disk}..."
 
     # Trigger udev to process the new partitions
-    partprobe "${disk}" 2>/dev/null || true
+    partprobe "${disk}" 2> /dev/null || true
     udevadm settle --timeout=10
 
     # Additional wait for devices
@@ -270,18 +270,18 @@ wait_for_partitions() {
     while [[ ! -e ${part1} ]] && [[ ${retries} -gt 0 ]]; do
         log_info "Waiting for ${part1} to appear... (${retries} retries left)"
         sleep 2
-        partprobe "${disk}" 2>/dev/null || true
+        partprobe "${disk}" 2> /dev/null || true
         udevadm settle --timeout=10
         retries=$((retries - 1))
-    done
+  done
 
     if [[ ! -e ${part1} ]]; then
         log_error "Partition ${part1} not found after partitioning"
         log_error "Available devices for ${disk}:"
-        ls -la "${disk}"* 2>/dev/null || true
-        ls -la /dev/disk/by-id/ | grep "$(basename "${disk}")" || true
+        ls -la "${disk}"* 2> /dev/null || true
+        ls -la /dev/disk/by-id/*"$(basename "${disk}")"* 2> /dev/null || true
         return 1
-    fi
+  fi
 
     log_info "Partitions created successfully for ${disk}"
 }
@@ -303,22 +303,24 @@ get_by_id_path() {
     if [[ ${device} =~ ^/dev/disk/by-(id|uuid|path|partuuid)/ ]]; then
         echo "${device}"
         return 0
-    fi
+  fi
 
     # Try to find the by-id equivalent
     local basename_dev
+    local prefix
     basename_dev="$(basename "${device}")"
 
     # Look for various by-id formats
     for prefix in "ata-" "nvme-" "scsi-" "wwn-"; do
-        by_id_path="$(find /dev/disk/by-id/ -name "${prefix}*" -lname "*${basename_dev}" 2>/dev/null | grep -v part | head -1)"
+        by_id_path="$(find /dev/disk/by-id/ -name "${prefix}*" -lname \
+          "*${basename_dev}" 2> /dev/null | grep -v part | head -1)"
         if [[ -n ${by_id_path} ]]; then
             echo "${by_id_path}"
             return 0
-        fi
-    done
+    fi
+  done
 
-    # If no by-id path found, return original
+    # If no by-id path found, return the original
     log_warn "Could not find by-id path for ${device}"
     echo "${device}"
 }
@@ -337,37 +339,37 @@ validate_disk() {
 
     log_info "Validating ${disk}..."
 
-    # Check if device exists and is a block device
+    # Check if a device exists and is a block device
     if [[ ! -b ${disk} ]]; then
         log_error "${disk} is not a block device or doesn't exist"
         return 1
-    fi
+  fi
 
-    # Check if disk has any mounted partitions
-    if lsblk -n -o MOUNTPOINT "${disk}" 2>/dev/null | grep -q '^/'; then
+    # Check if the disk has any mounted partitions
+    if lsblk -n -o MOUNTPOINT "${disk}" 2> /dev/null | grep -q '^/'; then
         log_error "${disk} has mounted partitions"
         lsblk "${disk}" | grep -E "[a-zA-Z].*/$"
         return 1
-    fi
+  fi
 
     # Check minimum size (167GB per disk)
     local size
-    size="$(lsblk -b -n -d -o SIZE "${disk}" 2>/dev/null | head -1)"
+    size="$(lsblk -b -n -d -o SIZE "${disk}" 2> /dev/null | head -1)"
     if [[ -z ${size} ]]; then
         log_error "Cannot determine size of ${disk}"
         return 1
-    fi
+  fi
 
     local size_gb=$((size / 1024 / 1024 / 1024))
     if ((size_gb < 167)); then
         log_error "${disk} is only ${size_gb}GB (minimum 167GB required)"
         return 1
-    fi
+  fi
 
-    # Check if disk is in use
-    if fuser "${disk}" &>/dev/null; then
+    # Check if the disk is in use
+    if fuser "${disk}" &> /dev/null; then
         log_warn "${disk} is currently in use by another process"
-    fi
+  fi
 
     # Check disk health if possible
     check_disk_health "${disk}"
@@ -387,28 +389,28 @@ check_disk_health() {
     local disk="$1"
     local real_device
 
-    # Resolve symlink to real device for health checks
+    # Resolve symlink to a real device for health checks
     real_device="$(readlink -f "${disk}")"
 
     if [[ ${real_device} == *nvme* ]]; then
-        if command -v nvme &>/dev/null; then
+        if command -v nvme &> /dev/null; then
             local health_status
-            health_status="$(nvme smart-log "${real_device}" 2>/dev/null |
-                grep "critical_warning" | awk '{print $3}' || echo "unknown")"
+            health_status="$(nvme smart-log "${real_device}" 2> /dev/null | \
+              grep "critical_warning" | awk '{print $3}' || echo "unknown")"
             if [[ ${health_status} != "0" ]] && [[ ${health_status} != "unknown" ]]; then
                 log_warn "NVMe disk ${disk} shows critical warning: ${health_status}"
-            fi
-        fi
-    else
-        if command -v smartctl &>/dev/null; then
+      fi
+    fi
+  else
+        if command -v smartctl &> /dev/null; then
             local health_status
-            health_status="$(smartctl -H "${real_device}" 2>/dev/null |
-                grep "SMART overall-health" | awk '{print $6}' || echo "unknown")"
+            health_status="$(smartctl -H "${real_device}" 2> /dev/null \
+              | grep "SMART overall-health" | awk '{print $6}' || echo "unknown")"
             if [[ ${health_status} != "PASSED" ]] && [[ ${health_status} != "unknown" ]]; then
                 log_warn "SMART health check failed for ${disk}: ${health_status}"
-            fi
-        fi
+      fi
     fi
+  fi
 }
 
 #######################################
@@ -424,25 +426,27 @@ detect_ashift() {
 
     if [[ ${real_device} == *nvme* ]]; then
         # Try to detect actual sector size for NVMe
-        if command -v nvme >/dev/null 2>&1; then
+        if command -v nvme > /dev/null 2>&1; then
             local sector_size
-            sector_size="$(nvme id-ns "${real_device}" -n 1 2>/dev/null |
-                grep "LBA Format" | grep "in use" | awk '{print $5}' | tr -d '()' || echo "")"
+            sector_size="$(nvme id-ns "${real_device}" -n 1 2> /dev/null \
+              | grep "LBA Format" | grep "in use" \
+              | awk '{print $5}' | tr -d '()' || echo "")"
 
             if [[ ${sector_size} == "8192" ]]; then
                 ashift=13
-            else
+      else
                 ashift=12 # Default to 4K for NVMe
-            fi
-            log_info "NVMe detected: Using ashift=${ashift} for ${sector_size:-4096} byte sectors"
-        else
+      fi
+            log_info "NVMe detected: Using ashift=${ashift} for \
+            ${sector_size:-4096} byte sectors"
+    else
             ashift=12
             log_info "NVMe detected: Using default ashift=${ashift}"
-        fi
-    else
+    fi
+  else
         ashift=12 # Standard for modern SATA SSDs
         log_info "SATA/SAS detected: Using ashift=${ashift} for 4096 byte sectors"
-    fi
+  fi
 }
 
 ################################################################################
@@ -461,9 +465,9 @@ phase1_environment_preparation() {
 
     if should_skip_phase "phase1"; then
         return 0
-    fi
+  fi
 
-    # Create log directory
+    # Create a log directory
     mkdir -p "${LOG_DIR}"
 
     # Check for root privileges
@@ -481,19 +485,19 @@ phase1_environment_preparation() {
     if ! apt install --yes gdisk zfsutils-linux rsync parted; then
         log_error "Failed to install required packages"
         exit 1
-    fi
+  fi
 
     # Install NVMe tools if NVMe disks are detected
-    if ls /dev/nvme* >/dev/null 2>&1; then
+    if ls /dev/nvme* > /dev/null 2>&1; then
         log_info "NVMe disks detected, installing nvme-cli..."
         apt install --yes nvme-cli || log_warn "Failed to install nvme-cli"
-    fi
+  fi
 
     # Install SMART tools
     apt install --yes smartmontools || log_warn "Failed to install smartmontools"
 
     # Stop ZFS Event Daemon to prevent conflicts
-    systemctl stop zed 2>/dev/null || true
+    systemctl stop zed 2> /dev/null || true
 
     save_checkpoint "phase1"
     log_info "Phase 1 completed successfully"
@@ -503,58 +507,154 @@ phase1_environment_preparation() {
 # Phase 2: Disk Selection
 ################################################################################
 
-#######################################
-# Display available disks for selection
-# Globals:
-#   None
-# Arguments:
-#   None
-#######################################
+############################################
+# Global array for device information
+# Each device uses 3 consecutive indices:
+#   [n*3+0] = traditional device name (e.g., /dev/nvme0n1, /dev/sda)
+#   [n*3+1] = EUI/WWN ID from /dev/disk/by-id/
+#   [n*3+2] = actual size in GB
+############################################
 display_available_disks() {
-    log_info "Scanning for available disks..."
+  declare -a devices_array=()
+  local device=""
+  local device_path=""
+  local device_id=""
+  local device_size=""
+  local device_type=""
+  local is_removable=""
 
-    echo -e "\n${BLUE}Available disks:${NC}\n"
-    echo "=================================================================================="
-    printf "%-20s %-10s %-15s %s\n" "DEVICE" "SIZE" "TYPE" "BY-ID PATH"
-    echo "=================================================================================="
+  log_info "Scanning for available disks..."
+  # Clear array
+  devices_array=()
 
-    # Display all block devices
-    local device size model by_id real_type
+  # Process all disk devices from lsblk
+  while IFS= read -r device; do
+    device_path="/dev/${device}"
 
-    # Process all disk devices
-    for device in $(lsblk -d -n -o NAME,TYPE | grep disk | awk '{print $1}'); do
-        device="/dev/${device}"
-        if [[ ! -b ${device} ]]; then
-            continue
-        fi
+    # Skip if not a block device
+    if [[ ! -b ${device_path}   ]]; then
+      continue
+    fi
 
-        size="$(lsblk -b -d -n -o SIZE "${device}" 2>/dev/null | head -1)"
-        size_gb=$((size / 1024 / 1024 / 1024))
-        model="$(lsblk -d -n -o MODEL "${device}" 2>/dev/null | head -1 | tr -s ' ')"
+    # Check if device is removable (skip USB/external drives)
+    is_removable="$(cat "/sys/block/${device}/removable" 2> /dev/null \
+      || echo "1")"
+    if [[ ${is_removable} == "1"   ]]; then
+      continue
+    fi
 
-        # Determine device type
-        if [[ ${device} == *nvme* ]]; then
-            real_type="NVMe"
-        elif [[ ${device} == *sd* ]]; then
-            real_type="SATA/SAS"
-        else
-            real_type="Other"
-        fi
+    # Additional check for USB devices via the device path
+    # USB devices typically appear in /sys/block/{device}/device/subsystem
+    # pointing to usb
+    if [[ -L "/sys/block/${device}/device/subsystem" ]]; then
+      local subsystem
+      subsystem="$(basename "$(readlink \
+        "/sys/block/${device}/device/subsystem")" 2> /dev/null)"
+      if [[ ${subsystem} == "usb"   ]]; then
+        continue
+      fi
+    fi
 
-        # Find by-id path
-        by_id="$(get_by_id_path "${device}")"
+    # Check if a device is connected via USB by examining the device path
+    local device_uevent="/sys/block/${device}/device/uevent"
+    if [[ -f ${device_uevent}   ]]; then
+      if grep -q "DRIVER=usb-storage\|DRIVER=uas\|DEVTYPE=usb" \
+        "${device_uevent}" 2> /dev/null; then
+        continue
+      fi
+    fi
 
-        printf "%-20s %-10s %-15s %s\n" "${device}" "${size_gb}GB" "${real_type}" "${by_id}"
+    # Check parent device for USB connection
+    local parent_path="/sys/block/${device}"
+    if readlink -f "${parent_path}" | grep -q "/usb[0-9]/" 2> /dev/null; then
+      continue
+    fi
 
-        if [[ -n ${model} ]]; then
-            echo "  Model: ${model}"
-        fi
-    done
+    # Get device type - only process NVMe and SATA/SAS drives
+    if [[ ${device} =~ ^nvme[0-9]+n[0-9]+$   ]]; then
+      device_type="nvme"
+    elif [[ ${device} =~ ^sd[a-z]+$   ]]; then
+      device_type="sata"
+    else
+      # Skip other device types (loop, sr, etc.)
+      continue
+    fi
 
-    echo "=================================================================================="
-    echo ""
+    # Get device size in bytes
+    device_size="$(lsblk -b -d -n -o SIZE "${device_path}" 2> /dev/null | head -1)"
+    if [[ -z ${device_size}   ]] || [[ ${device_size} == "0"   ]]; then
+      continue
+    fi
+
+    # Find the by-id path (prefer EUI for NVMe, WWN for SATA)
+    device_id=""
+    if [[ ${device_type} == "nvme"   ]]; then
+      # Look for NVMe EUI identifier
+      device_id="$(find /dev/disk/by-id/ -type l -name "nvme-eui.*" -o -name \
+        "nvme-nvme.*" 2> /dev/null | while read -r link; do
+                     if [[ "$(readlink -f "${link}")" == "${device_path}" ]]; then
+                       echo "${link}"
+                       break
+          fi
+        done)"
+    else
+      # Look for WWN or ATA identifier for SATA/SAS
+      device_id="$(find /dev/disk/by-id/ -type l \( -name "wwn-*" -o -name \
+        "ata-*" \) 2> /dev/null | grep -v "\-part[0-9]" | while read -r link; do
+                     if [[ "$(readlink -f "${link}")" == "${device_path}" ]]; then
+                       echo "${link}"
+                       break
+          fi
+        done)"
+    fi
+
+    # If no by-id path found, skip this device (unreliable)
+    if [[ -z ${device_id}   ]]; then
+      # Try one more time with a broader search
+      device_id="$(find /dev/disk/by-id/ -type l 2> /dev/null \
+                                                             | grep -v "\-part[0-9]" \
+                                         | while read -r link; do
+                     if [[ "$(readlink -f "${link}")" == "${device_path}" ]]; then
+                       echo "${link}"
+                       break
+          fi
+        done            | head -1)"
+
+      if [[ -z ${device_id}   ]]; then
+        echo "Warning: No persistent ID found for ${device_path}, skipping..." >&2
+        continue
+      fi
+    fi
+
+    # Add to array (3 indices per device)
+    devices_array+=("${device_path}")  # Index n*3+0
+    devices_array+=("${device_id}")    # Index n*3+1
+    devices_array+=("${device_size}")  # Index n*3+2
+
+  done < <(lsblk -d -n -o NAME,TYPE | grep disk | awk '{print $1}')
+
+  # Check if we found any devices
+  local num_devices=$((${#devices_array[@]} / 3))
+  if [[ ${num_devices} -eq 0 ]]; then
+    echo "Error: No suitable storage devices found" >&2
+    return 1
+  fi
+
+  # Print summary
+  echo "Found ${num_devices} storage device(s):"
+  echo ""
+  local i
+  for ((i = 0; i < ${#devices_array[@]}; i += 3)); do
+    local device_num=$((i / 3 + 1))
+    printf "[%d] %-15s  %10s   %s GB\n" \
+           "${device_num}" \
+           "${devices_array[i]}" \
+           "${devices_array[i + 1]}" \
+           "$((devices_array[i + 2] / 1024 / 1024 / 1024))"
+  done
+  echo ""
+  return 0
 }
-
 #######################################
 # Select three disks for installation
 # Globals:
@@ -570,60 +670,18 @@ phase2_disk_selection() {
         if [[ -f ${INSTALL_VARS_FILE} ]]; then
             # shellcheck source=/dev/null
             source "${INSTALL_VARS_FILE}"
-        fi
-        return 0
     fi
+        return 0
+  fi
 
     display_available_disks
 
-    echo -e "${YELLOW}IMPORTANT: You must use /dev/disk/by-id/ paths for reliability!${NC}"
+    echo -e "${YELLOW}IMPORTANT:${NC} You must use /dev/disk/by-id/ paths for reliability!"
+    echo ""
     echo "The script will help convert regular paths to by-id paths."
     echo ""
     echo "Please select three disks for RAIDZ1 configuration."
     echo ""
-
-    # Function to read and validate disk selection
-    select_disk() {
-        local prompt="$1"
-        local selected_disk
-
-        while true; do
-            read -r -p "${prompt}: " selected_disk
-
-            # Check if disk exists
-            if [[ ! -b ${selected_disk} ]]; then
-                log_error "Device ${selected_disk} does not exist"
-                continue
-            fi
-
-            # Convert to by-id path if needed
-            if [[ ! ${selected_disk} =~ ^/dev/disk/by- ]]; then
-                local by_id_disk
-                by_id_disk="$(get_by_id_path "${selected_disk}")"
-
-                if [[ ${by_id_disk} != "${selected_disk}" ]]; then
-                    log_info "Found by-id path: ${by_id_disk}"
-                    if confirm "Use ${by_id_disk} instead of ${selected_disk}?"; then
-                        selected_disk="${by_id_disk}"
-                    else
-                        log_warn "Using non-persistent path ${selected_disk} (NOT RECOMMENDED)"
-                        if ! confirm "Are you sure you want to continue with ${selected_disk}?"; then
-                            continue
-                        fi
-                    fi
-                else
-                    log_warn "Could not find by-id path for ${selected_disk}"
-                    log_warn "Using device path directly (NOT RECOMMENDED)"
-                    if ! confirm "Continue with ${selected_disk}?"; then
-                        continue
-                    fi
-                fi
-            fi
-
-            echo "${selected_disk}"
-            return 0
-        done
-    }
 
     # Select three disks
     disk1="$(select_disk "Enter first disk (DISK1)")"
@@ -634,7 +692,7 @@ phase2_disk_selection() {
     if [[ ${disk1} == "${disk2}" ]] || [[ ${disk2} == "${disk3}" ]] || [[ ${disk1} == "${disk3}" ]]; then
         log_error "You selected the same disk multiple times!"
         exit 1
-    fi
+  fi
 
     # Validate all selected disks
     local disk
@@ -642,10 +700,10 @@ phase2_disk_selection() {
         if ! validate_disk "${disk}"; then
             log_error "Disk validation failed: ${disk}"
             exit 1
-        fi
-    done
+    fi
+  done
 
-    # Check if all disks are same size
+    # Check if all disks are the same size
     check_disk_size_consistency
 
     # Detect optimal ashift
@@ -661,7 +719,7 @@ phase2_disk_selection() {
 
     if ! confirm "Proceed with these disks?"; then
         exit 1
-    fi
+  fi
 
     save_checkpoint "phase2"
     log_info "Phase 2 completed successfully"
@@ -689,10 +747,10 @@ check_disk_size_consistency() {
 
         if ! confirm "Continue with different sized disks?"; then
             exit 1
-        fi
-    else
-        log_info "All disks are the same size: $((size1 / 1024 / 1024 / 1024))GB"
     fi
+  else
+        log_info "All disks are the same size: $((size1 / 1024 / 1024 / 1024))GB"
+  fi
 }
 
 ################################################################################
@@ -712,7 +770,7 @@ clear_existing_data() {
     log_warn "WARNING: This will DESTROY all data on the selected disks!"
     if ! confirm "Continue with disk preparation?"; then
         exit 1
-    fi
+  fi
 
     # Disable any swap partitions
     swapoff --all
@@ -722,17 +780,17 @@ clear_existing_data() {
         log_info "Clearing ${disk}..."
 
         # Wipe filesystem signatures
-        wipefs -a "${disk}" 2>/dev/null || true
+        wipefs -a "${disk}" 2> /dev/null || true
 
         # Clear partition table
         sgdisk --zap-all "${disk}"
 
         # Clear any LVM metadata
-        dd if=/dev/zero of="${disk}" bs=1M count=10 2>/dev/null || true
+        dd if=/dev/zero of="${disk}" bs=1M count=10 2> /dev/null || true
 
         # Inform kernel of changes
-        partprobe "${disk}" 2>/dev/null || true
-    done
+        partprobe "${disk}" 2> /dev/null || true
+  done
 
     # Wait for devices to settle
     udevadm settle --timeout=10
@@ -775,7 +833,7 @@ create_partition_layout() {
 
         # Wait for partitions to be created
         wait_for_partitions "${disk}"
-    done
+  done
 }
 
 #######################################
@@ -797,13 +855,13 @@ format_efi_partitions() {
         if [[ ! -b ${efi_part} ]]; then
             log_error "EFI partition ${efi_part} does not exist!"
             return 1
-        fi
+    fi
 
         # Format as FAT32
         mkdosfs -F 32 -s 1 -n "EFI${num}" "${efi_part}"
 
         num=$((num + 1))
-    done
+  done
 }
 
 #######################################
@@ -818,7 +876,7 @@ phase3_disk_preparation() {
 
     if should_skip_phase "phase3"; then
         return 0
-    fi
+  fi
 
     clear_existing_data
     create_partition_layout
@@ -851,8 +909,8 @@ create_boot_pool() {
         if [[ ! -b ${part} ]]; then
             log_error "Partition ${part} does not exist!"
             return 1
-        fi
-    done
+    fi
+  done
 
     zpool create \
         -o ashift="${ashift}" \
@@ -870,10 +928,10 @@ create_boot_pool() {
         bpool raidz1 "${part3_1}" "${part3_2}" "${part3_3}"
 
     # Verify creation
-    if ! zpool list bpool >/dev/null 2>&1; then
+    if ! zpool list bpool > /dev/null 2>&1; then
         log_error "Failed to create bpool"
         exit 1
-    fi
+  fi
 
     zpool status bpool
     log_info "Boot pool created successfully"
@@ -898,8 +956,8 @@ create_root_pool() {
         if [[ ! -b ${part} ]]; then
             log_error "Partition ${part} does not exist!"
             return 1
-        fi
-    done
+    fi
+  done
 
     echo "You will be prompted to enter an encryption passphrase for the root pool."
     echo "IMPORTANT: Remember this passphrase! You cannot recover data without it!"
@@ -917,10 +975,10 @@ create_root_pool() {
         rpool raidz1 "${part4_1}" "${part4_2}" "${part4_3}"
 
     # Verify creation
-    if ! zpool list rpool >/dev/null 2>&1; then
+    if ! zpool list rpool > /dev/null 2>&1; then
         log_error "Failed to create rpool"
         exit 1
-    fi
+  fi
 
     zpool status rpool
     log_info "Root pool created successfully"
@@ -945,8 +1003,8 @@ create_home_pool() {
         if [[ ! -b ${part} ]]; then
             log_error "Partition ${part} does not exist!"
             return 1
-        fi
-    done
+    fi
+  done
 
     echo "You will be prompted to enter an encryption passphrase for the home pool."
     echo "IMPORTANT: Remember this passphrase! You cannot recover data without it!"
@@ -964,10 +1022,10 @@ create_home_pool() {
         hpool raidz1 "${part5_1}" "${part5_2}" "${part5_3}"
 
     # Verify creation
-    if ! zpool list hpool >/dev/null 2>&1; then
+    if ! zpool list hpool > /dev/null 2>&1; then
         log_error "Failed to create hpool"
         exit 1
-    fi
+  fi
 
     zpool status hpool
     log_info "Home pool created successfully"
@@ -985,7 +1043,7 @@ phase4_zfs_pool_creation() {
 
     if should_skip_phase "phase4"; then
         return 0
-    fi
+  fi
 
     create_boot_pool
     create_root_pool
@@ -1010,7 +1068,7 @@ backup_encryption_keys() {
 
     mkdir -p /mnt/root/zfs-keys-backup
 
-    cat >/mnt/root/zfs-keys-backup/CRITICAL-README.txt <<'END'
+    cat > /mnt/root/zfs-keys-backup/CRITICAL-README.txt << 'END'
 ZFS Encryption Backup Information
 ==================================
 
@@ -1027,9 +1085,9 @@ END
 
     # Save encryption metadata
     zfs get encryption,keyformat,keylocation,keystatus rpool \
-        >/mnt/root/zfs-keys-backup/rpool-encryption.txt
+    > /mnt/root/zfs-keys-backup/rpool-encryption.txt
     zfs get encryption,keyformat,keylocation,keystatus hpool \
-        >/mnt/root/zfs-keys-backup/hpool-encryption.txt
+    > /mnt/root/zfs-keys-backup/hpool-encryption.txt
 
     log_warn "Encryption keys information saved to /mnt/root/zfs-keys-backup/"
     echo "Press ENTER after backing up encryption keys..."
@@ -1055,13 +1113,13 @@ phase5_dataset_creation() {
         if [[ -f ${INSTALL_VARS_FILE} ]]; then
             # shellcheck source=/dev/null
             source "${INSTALL_VARS_FILE}"
-        fi
-        return 0
     fi
+        return 0
+  fi
 
     # Generate unique installation ID
-    uuid="$(dd if=/dev/urandom bs=1 count=100 2>/dev/null |
-        tr -dc 'a-z0-9' | cut -c-6)"
+    uuid="$(dd if=/dev/urandom bs=1 count=100 2> /dev/null \
+                                                          | tr -dc 'a-z0-9' | cut -c-6)"
 
     log_info "Installation UUID: ${uuid}"
 
@@ -1112,7 +1170,7 @@ create_system_subdatasets() {
         var/lib/AccountsService var/lib/NetworkManager \
         usr/local srv; do
         zfs create "rpool/ROOT/kubuntu_${uuid}/${dataset}"
-    done
+  done
 
     chmod 1777 /mnt/var/tmp
 }
@@ -1162,31 +1220,31 @@ extract_base_system() {
 
     if [[ -z ${iso_source} ]]; then
         iso_source="$(blkid -L "Kubuntu" || blkid -L "Ubuntu" || echo "")"
-    fi
+  fi
 
     if [[ -z ${iso_source} ]]; then
         log_error "Cannot find Kubuntu ISO source"
         echo "Available devices:"
         lsblk -o NAME,LABEL,FSTYPE,SIZE,MOUNTPOINT | grep -E "iso9660|udf"
         read -r -p "Enter the device containing the Kubuntu ISO: " iso_source
-    fi
+  fi
 
     # Mount the ISO
     if [[ -b ${iso_source} ]]; then
         mount "${iso_source}" /mnt/cdrom
-    elif [[ -f ${iso_source} ]]; then
+  elif   [[ -f ${iso_source} ]]; then
         mount -o loop "${iso_source}" /mnt/cdrom
-    else
+  else
         log_error "Cannot mount ISO source: ${iso_source}"
         exit 1
-    fi
+  fi
 
     # Verify squashfs exists
     local squashfs="/mnt/cdrom/casper/filesystem.squashfs"
     if [[ ! -f ${squashfs} ]]; then
         log_error "Cannot find filesystem.squashfs"
         exit 1
-    fi
+  fi
 
     # Mount and copy filesystem
     mkdir -p /mnt/source
@@ -1219,8 +1277,8 @@ configure_system_environment() {
     cp /etc/zfs/zpool.cache /mnt/etc/zfs/
 
     # Set hostname
-    echo "${HOSTNAME}" >/mnt/etc/hostname
-    cat >/mnt/etc/hosts <<END
+    echo "${HOSTNAME}" > /mnt/etc/hostname
+    cat > /mnt/etc/hosts << END
 127.0.0.1 localhost
 127.0.1.1 ${HOSTNAME}
 ::1 localhost ip6-localhost ip6-loopback
@@ -1229,7 +1287,7 @@ ff02::2 ip6-allrouters
 END
 
     # Configure package sources
-    cat >/mnt/etc/apt/sources.list <<END
+    cat > /mnt/etc/apt/sources.list << END
 deb http://archive.ubuntu.com/ubuntu ${UBUNTU_VERSION} main restricted universe multiverse
 deb http://archive.ubuntu.com/ubuntu ${UBUNTU_VERSION}-updates main restricted universe multiverse
 deb http://archive.ubuntu.com/ubuntu ${UBUNTU_VERSION}-backports main restricted universe multiverse
@@ -1241,7 +1299,7 @@ END
     interface="$(ip route | grep default | awk '{print $5}' | head -1)"
 
     mkdir -p /mnt/etc/netplan
-    cat >/mnt/etc/netplan/01-netcfg.yaml <<END
+    cat > /mnt/etc/netplan/01-netcfg.yaml << END
 network:
   version: 2
   ethernets:
@@ -1250,7 +1308,7 @@ network:
 END
 
     # Save installation variables
-    cat >"${INSTALL_VARS_FILE}" <<END
+    cat > "${INSTALL_VARS_FILE}" << END
 # Installation variables - DO NOT DELETE
 export DISK1="${disk1}"
 export DISK2="${disk2}"
@@ -1274,7 +1332,7 @@ phase6_system_installation() {
 
     if should_skip_phase "phase6"; then
         return 0
-    fi
+  fi
 
     extract_base_system
     configure_system_environment
@@ -1323,7 +1381,7 @@ phase7_8_9_chroot_operations() {
 #   None
 #######################################
 create_chroot_script() {
-    cat >/mnt/root/chroot-install.sh <<'CHROOT_SCRIPT'
+    cat > /mnt/root/chroot-install.sh << 'CHROOT_SCRIPT'
 #!/bin/bash
 set -euo pipefail
 
@@ -1509,8 +1567,8 @@ cleanup_and_export() {
     log_info "Cleaning up and exporting pools..."
 
     # Unmount filesystems
-    mount | grep -v zfs | tac | awk '/\/mnt/ {print $3}' |
-        xargs -I {} umount -lf {} 2>/dev/null || true
+    mount | grep -v zfs | tac | awk '/\/mnt/ {print $3}' \
+                                                         | xargs -I {} umount -lf {} 2> /dev/null || true
 
     # Export pools
     zpool export bpool
@@ -1564,8 +1622,8 @@ main() {
         if ! confirm "Resume installation from ${checkpoint}?"; then
             rm -f "${CHECKPOINT_FILE}"
             log_info "Starting fresh installation"
-        fi
     fi
+  fi
 
     # Execute installation phases
     phase1_environment_preparation
@@ -1594,7 +1652,7 @@ main() {
 
     if confirm "Reboot now?"; then
         reboot
-    fi
+  fi
 }
 
 # Execute main function
